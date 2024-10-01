@@ -1,14 +1,15 @@
 import re
 import sys
 import time
-import pytz
 import json
 import queue
 import requests
 from loguru import logger
 from bs4 import BeautifulSoup
+from dateutil.tz import tzlocal
 from flask import Flask, request
 from datetime import datetime, timedelta
+from requests.adapters import HTTPAdapter, Retry
 from apscheduler.schedulers.background import BackgroundScheduler
 # 'flask_ngrok' is so obsolete and probably can't work with latest ngrok binary, so use ngrok directly
 # from flask_ngrok import run_with_ngrok
@@ -26,12 +27,18 @@ ORIGIN_EMAIL = "chensiyu1618@gmail.com"
 CHANGE_EMAIL = "ad3b7c43d6f9fe7bac44@cloudmailin.net"
 OFFICE_REGEX = "Langley.*Willowbrook" # "Campbell.*"
 
+# there're 2 types of timeout in requests
+# 1. connect timeout
+# 2. reading timeout (if it's not set and network is slow, app'll be in waiting state until reading completed, looks like being hanged) 
+CONN_TIMEOUT = 8
+READ_TIMEOUT = 16
+MAXI_RETRIES = 4
+
 FLASK_EXEC_PORT = 5000
 MAX_RETRY_TIMES = 2
 MAX_WAIT_SECONDS = 16
 SCHED_JOB_ID = "apiTrigger"
-SCHED_TIMEZONE = "Asia/Shanghai"
-SCHED_INTERVAL = 60
+SCHED_INTERVAL = 40
 STARTUP_DELAY_SECS = 4
 RESCHED_DELAY_SECS = 8
 AGENT_HEADER = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -39,6 +46,10 @@ AGENT_HEADER = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.
 queueOTP = queue.Queue()
 logger.remove()
 logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} {level} {message}", level="INFO")
+
+# global session for setting of 'Retry'
+session = requests.Session()
+session.mount("https://", HTTPAdapter(max_retries=Retry(total=MAXI_RETRIES, backoff_factor=1.0))) # 0.0s, 2.0s, 4.0s, 8.0s, ...
 
 app = Flask(__name__)
 @app.route("/interceptOTP", methods = ['GET', 'POST'])
@@ -68,7 +79,7 @@ def update_emailaddress(token, drvrId, firstName, email, phoneNum):
         },
         "phoneNum": phoneNum
     }
-    updateEmailResponse = requests.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/web/updateContactDetails', headers = updateEmailRequestHeader, json = updateEmailRequestBody)
+    updateEmailResponse = session.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/web/updateContactDetails', headers=updateEmailRequestHeader, json=updateEmailRequestBody, timeout=(CONN_TIMEOUT,READ_TIMEOUT))
     if 200 != updateEmailResponse.status_code:
         return False
     return True
@@ -76,7 +87,7 @@ def update_emailaddress(token, drvrId, firstName, email, phoneNum):
 def token_driver_info():
     loginReqestHeader = {"User-Agent": AGENT_HEADER}
     loginReqestBody = {"drvrLastName": DRVR_LASTNAME, "licenceNumber": LICENSE_NUMBER, "keyword": SIGNIN_KEYWORD}
-    loginResponse = requests.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/webLogin/webLogin', headers = loginReqestHeader, json = loginReqestBody)
+    loginResponse = session.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/webLogin/webLogin', headers=loginReqestHeader, json=loginReqestBody, timeout=(CONN_TIMEOUT,READ_TIMEOUT))
     return loginResponse.status_code, loginResponse.headers['Authorization'], json.loads(loginResponse.text)
 
 def icbc_apicall_trigger(sched, queueOTP):
@@ -85,7 +96,7 @@ def icbc_apicall_trigger(sched, queueOTP):
     statusCode, accessToken, drvrInfo = token_driver_info()
     if 200 != statusCode:
         logger.error("Failed to login and retrieve access token[exit], %s" % str(statusCode))
-        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=RESCHED_DELAY_SECS))
+        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(tzlocal()) + timedelta(seconds=RESCHED_DELAY_SECS))
         return
     logger.debug(accessToken)
     drvrId = drvrInfo['drvrId']
@@ -95,10 +106,10 @@ def icbc_apicall_trigger(sched, queueOTP):
     # find office position ID
     getOfficeReqestHeader = {"Authorization": accessToken, "User-Agent": AGENT_HEADER}
     getOfficeReqestBody = {"examType": LICENSE_TYPE, "startDate": START_DATE}
-    getOfficeResponse = requests.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/web/getPosByExam', headers = getOfficeReqestHeader, json = getOfficeReqestBody)
+    getOfficeResponse = session.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/web/getPosByExam', headers=getOfficeReqestHeader, json=getOfficeReqestBody, timeout=(CONN_TIMEOUT,READ_TIMEOUT))
     if 200 != getOfficeResponse.status_code:
         logger.error("Failed to acquire road test office list[exit], %s" % str(getOfficeResponse.status_code))
-        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=RESCHED_DELAY_SECS))
+        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(tzlocal()) + timedelta(seconds=RESCHED_DELAY_SECS))
         return
     getOfficeResponseJson = json.loads(getOfficeResponse.text)
     pattern = re.compile(OFFICE_REGEX)
@@ -110,14 +121,14 @@ def icbc_apicall_trigger(sched, queueOTP):
             continue;
         elif len(result.groups()) > 1:
             logger.error("Failed to match office regex[exit], %s" % str(result.group()))
-            sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=RESCHED_DELAY_SECS))
+            sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(tzlocal()) + timedelta(seconds=RESCHED_DELAY_SECS))
             return
         matchFlag = True
         officePosId = office['posId']
         break;
     if not matchFlag:
         logger.error("No road test office found[exit], %s" % OFFICE_REGEX)
-        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=RESCHED_DELAY_SECS))
+        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(tzlocal()) + timedelta(seconds=RESCHED_DELAY_SECS))
         return
 
     # get available appointments
@@ -132,10 +143,10 @@ def icbc_apicall_trigger(sched, queueOTP):
         "licenseNumber": LICENSE_NUMBER
     }
     getAppointmentsRequestHeader = {"Authorization": accessToken, "User-Agent": AGENT_HEADER}
-    getAppointmentsResponse = requests.request('POST','https://onlinebusiness.icbc.com/deas-api/v1/web/getAvailableAppointments', headers = getAppointmentsRequestHeader, json = getAppointmentsRequestBody)
+    getAppointmentsResponse = session.request('POST','https://onlinebusiness.icbc.com/deas-api/v1/web/getAvailableAppointments', headers=getAppointmentsRequestHeader, json=getAppointmentsRequestBody, timeout=(CONN_TIMEOUT,READ_TIMEOUT))
     if 200 != getAppointmentsResponse.status_code:
         logger.error("Failed to acquire available appointments of given office[exit], %s" % str(getAppointmentsResponse.status_code))
-        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=RESCHED_DELAY_SECS))
+        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(tzlocal()) + timedelta(seconds=RESCHED_DELAY_SECS))
         return
     getAppointmentsResponseJson = json.loads(getAppointmentsResponse.text)
     if 0 == len(getAppointmentsResponseJson):
@@ -155,7 +166,7 @@ def icbc_apicall_trigger(sched, queueOTP):
         logger.info("No appointment meets criteria[exit], '{0}','{1}','{2}','{3}'".format(START_DATE, CLOSE_DATE, START_TIME, CLOSE_TIME))
         return
     logger.info("Get one desired appointment, '{0}','{1}'".format(selectedAppointment['appointmentDt']['date'], selectedAppointment['startTm']))
-    
+
     # lock appointment
     lockAppointmentsRequestBody = {
         "appointmentDt": {
@@ -179,10 +190,10 @@ def icbc_apicall_trigger(sched, queueOTP):
         "signature": selectedAppointment['signature']
     }
     lockAppointmentRequestHeader = {"Authorization": accessToken, "User-Agent": AGENT_HEADER}
-    lockAppointmentResponse = requests.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/web/lock', headers = lockAppointmentRequestHeader, json = lockAppointmentsRequestBody)
+    lockAppointmentResponse = session.request('PUT','https://onlinebusiness.icbc.com/deas-api/v1/web/lock', headers=lockAppointmentRequestHeader, json=lockAppointmentsRequestBody, timeout=(CONN_TIMEOUT,READ_TIMEOUT))
     if 200 != lockAppointmentResponse.status_code:
         logger.error("Failed to lock one available appointment of given office[exit], %s" % str(lockAppointmentResponse.status_code))
-        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=RESCHED_DELAY_SECS))
+        sched.modify_job(job_id=SCHED_JOB_ID, next_run_time=datetime.now(tzlocal()) + timedelta(seconds=RESCHED_DELAY_SECS))
         return
     lockAppointmentResponseJson = json.loads(lockAppointmentResponse.text)
 
@@ -192,7 +203,8 @@ def icbc_apicall_trigger(sched, queueOTP):
         # send OTP
         sendOTPRequestHeader = {"Authorization": accessToken, "User-Agent": AGENT_HEADER}
         sendOTPRequestBody = {"bookedTs": current_timestamp(), "drvrID": drvrId, "method": "E"}
-        sendOTPResponse = requests.request('POST', 'https://onlinebusiness.icbc.com/deas-api/v1/web/sendOTP', headers = sendOTPRequestHeader, json = sendOTPRequestBody)
+        # if appointment get locked, we'd better have retries and more time for timeout in case of losing the chance easily
+        sendOTPResponse = session.request('POST', 'https://onlinebusiness.icbc.com/deas-api/v1/web/sendOTP', headers=sendOTPRequestHeader, json=sendOTPRequestBody, timeout=(2*CONN_TIMEOUT,2*READ_TIMEOUT))
         if 200 != sendOTPResponse.status_code:
             logger.error("Failed to send OTP to phone number in setting, %s" % str(sendOTPResponse.status_code))
             # continue to wait MAX_WAIT_SECONDS seconds if sending OTP failed in case too short interval of sending request
@@ -207,7 +219,7 @@ def icbc_apicall_trigger(sched, queueOTP):
             # verify OTP
             verifyOTPRequestHeader = {"Authorization": accessToken, "User-Agent": AGENT_HEADER}
             verifyOTPRequestBody = {"bookedTs": current_timestamp(), "drvrID": drvrId, "code": codeOTP}
-            verifyOTPResponse = requests.request('PUT', 'https://onlinebusiness.icbc.com/deas-api/v1/web/verifyOTP', headers = verifyOTPRequestHeader, json = verifyOTPRequestBody)
+            verifyOTPResponse = session.request('PUT', 'https://onlinebusiness.icbc.com/deas-api/v1/web/verifyOTP', headers=verifyOTPRequestHeader, json=verifyOTPRequestBody, timeout=(2*CONN_TIMEOUT,2*READ_TIMEOUT))
             if 200 != verifyOTPResponse.status_code:
                 logger.error("Failed to verify OTP, %s" % str(verifyOTPResponse.status_code))
             else:
@@ -221,7 +233,7 @@ def icbc_apicall_trigger(sched, queueOTP):
                         time.sleep(2)
                     bookRequestHeader = {"Authorization": accessToken, "User-Agent": AGENT_HEADER}
                     bookRequestBody = {"userId": "WEBD:" + str(drvrId), "appointment":{"drvrDriver":{"drvrId": drvrId}}}
-                    bookResponse = requests.request('PUT', 'https://onlinebusiness.icbc.com/deas-api/v1/web/book', headers = bookRequestHeader, json = bookRequestBody)
+                    bookResponse = session.request('PUT', 'https://onlinebusiness.icbc.com/deas-api/v1/web/book', headers=bookRequestHeader, json=bookRequestBody, timeout=(2*CONN_TIMEOUT,2*READ_TIMEOUT))
                     if 200 != bookResponse.status_code:
                         logger.error("Failed to request final book, %s" % str(bookResponse.status_code))
                     else:
@@ -256,6 +268,6 @@ if __name__ == "__main__":
     sched = BackgroundScheduler(timezone='MST')
     jobAdded = sched.add_job(icbc_apicall_trigger, 'interval', id=SCHED_JOB_ID, \
         seconds=SCHED_INTERVAL, max_instances=1, args=(sched, queueOTP), \
-        next_run_time=datetime.now(pytz.timezone(SCHED_TIMEZONE)) + timedelta(seconds=STARTUP_DELAY_SECS))
+        next_run_time=datetime.now(tzlocal()) + timedelta(seconds=STARTUP_DELAY_SECS))
     sched.start()
     app.run(port=FLASK_EXEC_PORT, debug=False) # run on default port '5000'
