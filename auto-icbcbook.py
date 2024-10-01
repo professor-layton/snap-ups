@@ -23,8 +23,8 @@ START_DATE = "2024-10-09" # format: YYYY-MM-DD
 CLOSE_DATE = "2024-10-19"
 START_TIME = "09:30" # format: HH:mm
 CLOSE_TIME = "15:30"
-ORIGIN_EMAIL = "chensiyu1618@gmail.com"
-CHANGE_EMAIL = "ad3b7c43d6f9fe7bac44@cloudmailin.net"
+ORIGIN_EMAIL = "<Your Email Address>"
+CHANGE_EMAIL = "<Delegate cloudmailin.net Address>"
 OFFICE_REGEX = "Langley.*Willowbrook" # "Campbell.*"
 
 # there're 2 types of timeout in requests
