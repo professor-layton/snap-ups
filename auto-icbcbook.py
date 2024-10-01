@@ -15,10 +15,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # from flask_ngrok import run_with_ngrok
 
 # user parameters
-DRVR_LASTNAME = "CHEN"
+DRVR_LASTNAME = "<Your Last Name>"
 LICENSE_TYPE = "5-R-1"
-LICENSE_NUMBER = "09648651"
-SIGNIN_KEYWORD = "SIRI528514"
+LICENSE_NUMBER = "<Your License>"
+SIGNIN_KEYWORD = "<Your Password>"
 START_DATE = "2024-10-09" # format: YYYY-MM-DD
 CLOSE_DATE = "2024-10-19"
 START_TIME = "09:30" # format: HH:mm
